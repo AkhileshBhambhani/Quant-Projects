@@ -1,6 +1,6 @@
-# CQF Final Project - Black-Litterman Portfolio Construction with Factor and Macro Views
+# Black-Litterman Portfolio Construction with Factor and Macro Views
 
-This folder contains my CQF Final Project submission, focused on portfolio construction using a Black-Litterman framework augmented with macro-conditioned factor signals.
+This project focused on portfolio construction using a Black-Litterman framework augmented with macro-conditioned factor signals.
 
 ## Project Objective
 
@@ -64,13 +64,6 @@ The notebook shows that macro-informed factor views can be integrated into Black
 - and realistic implementation constraints (turnover, costs, market frictions).
 
 Additional multi-regime and rolling-window validation is required before live deployment.
-
-## Folder Contents
-
-- `PC Akhilesh Bhambhani Code.ipynb` - Primary project notebook (methodology, code, outputs, interpretation)
-- `PC Akhilesh Bhambhani Code.html` - Rendered notebook output
-- `PC Akhilesh Bhambhani REPORT.pdf` - Final report
-- `June 25 Final Project Declaration.pdf` - Signed declaration
 
 ## Reproducibility Notes
 
