@@ -3,8 +3,13 @@
 # ============================================================================
 # Functions can be imported using from bl_functions import *
 
+import io
+import re
+import zipfile
+
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 import statsmodels.api as sm
 from sklearn.covariance import LedoitWolf
@@ -12,6 +17,7 @@ from scipy.optimize import minimize
 
 __all__ = [
     'factor_return_metrics',
+    'get_famafrench_daily',
     'split_data',
     'regression_analysis',
     'univariate_rolling_regression',
@@ -84,6 +90,39 @@ def factor_return_metrics(returns_df, start_date, end_date):
         }
 
     return pd.DataFrame(metrics).T
+
+
+def get_famafrench_daily(name, start=None, end=None):
+    """
+    Download and parse a Ken French daily factor dataset from Dartmouth.
+
+    Parameters:
+    -----------
+    name (str): Dataset name without the _CSV suffix
+        (e.g. 'F-F_Momentum_Factor_daily', 'F-F_Research_Data_Factors_daily')
+    start (str, optional): Start date in 'YYYY-MM-DD' format for filtering
+    end (str, optional): End date in 'YYYY-MM-DD' format for filtering
+
+    Returns:
+    --------
+    pd.DataFrame: Daily factor returns indexed by date
+    """
+    url = f"https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/{name}_CSV.zip"
+    raw = requests.get(url, timeout=30).content
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        text = zf.read(zf.namelist()[0]).decode("latin-1")
+
+    lines = [ln.rstrip(",") for ln in text.splitlines()]
+    date_re = re.compile(r"^\s*\d{8}\s*,")
+    data_rows = [i for i, ln in enumerate(lines) if date_re.match(ln)]
+    start_i, end_i = data_rows[0], data_rows[-1] + 1
+    header = [c.strip() or "Val" for c in lines[start_i - 1].split(",")]
+
+    csv_text = ",".join(["Date"] + header[1:]) + "\n" + "\n".join(lines[start_i:end_i])
+    df = pd.read_csv(io.StringIO(csv_text), index_col=0, parse_dates=[0], date_format="%Y%m%d")
+    if start is not None or end is not None:
+        df = df.loc[start:end]
+    return df
 
 
 def split_data(data, train_start_date, train_end_date, test_start_date, test_end_date):

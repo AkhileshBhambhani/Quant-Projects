@@ -15,6 +15,16 @@ This document provides a comprehensive summary of all functions defined in the p
   - Returns DataFrame with metrics as rows, assets/factors as columns
 - **Returns**: DataFrame with columns: Annualized Mean, Annualized Volatility, Sharpe Ratio, Max Drawdown
 
+##### `get_famafrench_daily(name, start=None, end=None)`
+- **Purpose**: Download and parse Ken French daily factor datasets directly from the Dartmouth FTP site
+- **Key Features**:
+  - Fetches zipped CSV files from Ken French's data library (e.g. momentum, FF research factors)
+  - Parses the raw file format manually to avoid `pandas_datareader` date-parsing failures on trailing commas
+  - Strips phantom trailing fields from each line before building a clean CSV string
+  - Detects data rows via 8-digit date pattern and reconstructs column headers automatically
+  - Optional date filtering via `start` and `end` parameters
+- **Returns**: DataFrame of daily factor returns with a datetime index
+
 ##### `split_data(data, train_start_date, train_end_date, test_start_date, test_end_date)`
 - **Purpose**: Split time series data into training and test sets
 - **Key Features**:
@@ -279,6 +289,7 @@ All optimization functions enforce:
 
 ```
 Data Processing
+├── get_famafrench_daily()
 ├── split_data()
 └── factor_return_metrics()
 
