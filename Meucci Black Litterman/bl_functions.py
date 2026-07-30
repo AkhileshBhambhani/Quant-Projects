@@ -16,22 +16,39 @@ from sklearn.covariance import LedoitWolf
 from scipy.optimize import minimize
 
 __all__ = [
+    # Data processing
     'factor_return_metrics',
     'get_famafrench_daily',
     'split_data',
+    # Regression
     'regression_analysis',
     'univariate_rolling_regression',
     'multivariate_rolling_regression',
+    # Legacy macro-signal view pipeline (superseded, retained as documentation)
     'process_macro_signals',
     'generate_tactical_views',
+    # Regime classification and conditional statistics (current view pipeline)
+    'label_regimes',
+    'episode_id',
+    'count_episodes',
+    'regime_snapshot',
+    'occupancy',
+    'association',
+    'era_split',
+    'test_drift',
+    'conditional_stats',
+    # Weights, covariance, risk aversion
     'weight_calc',
     'calculate_covariance_matrices',
     'lambda_calc',
+    # Black-Litterman
     'generate_P_matrix',
     'meucci_black_litterman',
+    # Optimizers
     'optimize_mean_variance',
     'optimize_max_sharpe',
     'optimize_erc',
+    # Performance
     'portfolio_return_metrics',
     'calculate_portfolio_return_series',
     'generate_portfolio_returns_dataframe',
@@ -442,6 +459,280 @@ def generate_tactical_views(macro_signals_df, tactical_results, factors_list, co
             
     return views
 
+# ============================================================================
+# Regime classification
+# ============================================================================
+
+def label_regimes(df):
+    """
+    Regime labels. Every threshold is real-time: fixed economic
+    constants, or an expanding-window statistic. No future information.
+
+    Parameters:
+    -----------
+    df (pd.DataFrame): Monthly macro panel, already lagged to publication
+        schedule. Must contain: cfnai, cpi_yoy, cpi_med (expanding median of
+        cpi_yoy), real_ff, curve, vix, cpi_dir
+
+    Returns:
+    --------
+    pd.DataFrame: Same index as `df`, with conditioner columns
+        (growth, infl_lvl, policy), grid columns (grid_A, grid_B, grid_M) and
+        diagnostic-only columns (curve_d, vol_d, dir_d)
+    """
+    out = pd.DataFrame(index=df.index)
+
+    # --- Conditioners -------------------------------------------------
+    # CFNAI is constructed so 0 = trend growth
+    out['growth']   = np.where(df['cfnai']   < 0.0,           'below_trend',   'above_trend')
+    # Inflation relative to its own expanding median (see note below)
+    out['infl_lvl'] = np.where(df['cpi_yoy'] > df['cpi_med'], 'high',          'low')
+    # Real fed funds: positive = restrictive
+    out['policy']   = np.where(df['real_ff'] < 0.0,           'accommodative', 'restrictive')
+
+    # --- Grids, per the pre-committed assignment ----------------------
+    out['grid_A'] = out['growth'] + ' / ' + out['infl_lvl']   # HML
+    out['grid_B'] = out['growth'] + ' / ' + out['policy']     # SMB
+    out['grid_M'] = out['growth']                             # MOM (marginal)
+
+    # --- Diagnostic only ----------------------------------------------
+    out['curve_d'] = np.where(df['curve']   < 0.0,  'inverted', 'normal')
+    out['vol_d']   = np.where(df['vix']     > 20.0, 'high',     'low')
+    out['dir_d']   = np.where(df['cpi_dir'] > 0.0,  'rising',   'falling')
+    return out
+
+
+# ============================================================================
+# Episode helpers
+# ============================================================================
+
+def episode_id(mask):
+    """Label each contiguous run of True with a distinct integer id.
+
+    Returns a Series aligned to `mask`, holding the run id where mask is True
+    and NaN elsewhere. Used to group returns within an episode so that
+    uncertainty can be computed across episodes rather than across months.
+    """
+    m = mask.astype(int)
+    return (m.diff() == 1).cumsum().where(mask)
+
+
+def count_episodes(mask):
+    """Number of contiguous runs where `mask` is True.
+
+    `.diff() == 1` counts every transition False -> True but cannot see a run
+    that is already in progress at the first observation, so that case is
+    added explicitly.
+    """
+    m = mask.astype(int)
+    n = int((m.diff() == 1).sum())
+    if len(m) and m.iloc[0] == 1:
+        n += 1
+    return n
+
+
+# ============================================================================
+# Regime verification helpers
+# ============================================================================
+# Each returns a DataFrame rather than printing, so output renders as a table
+# and can be reused - exported, asserted on, or referenced downstream.
+
+def regime_snapshot(period, regimes, macro, spec, sample=None):
+    """Classification at a single date, with distance to each threshold.
+
+    `spec` maps regime column -> (macro column, threshold, label_if_above).
+    Threshold may be a constant or the name of a column (e.g. an expanding median).
+
+    Margin is reported in the variable's own units and, more usefully, scaled by
+    that variable's standard deviation - CFNAI is an index, inflation a decimal
+    rate, so raw margins are not comparable across rows.
+    """
+    sample = macro if sample is None else sample
+    rows = []
+    for reg_col, (macro_col, thresh, _) in spec.items():
+        val = macro.loc[period, macro_col]
+        thr = macro.loc[period, thresh] if isinstance(thresh, str) else thresh
+        sd  = sample[macro_col].std()
+        margin = val - thr
+        rows.append({
+            'variable':    reg_col,
+            'input':       macro_col,
+            'value':       val,
+            'threshold':   thr,
+            'margin':      margin,
+            'margin_/_sd': margin / sd if sd else np.nan,
+            'label':       regimes.loc[period, reg_col],
+        })
+    out = pd.DataFrame(rows).set_index('variable')
+    # within 0.25 sd of the threshold -> could flip on a data revision
+    out['fragile'] = out['margin_/_sd'].abs() < 0.25
+    return out
+
+
+def occupancy(regimes, cols, n_total=None):
+    """Months, independent episodes, and average episode length per state.
+
+    `se_inflation` = sqrt(avg episode length), approximately the factor by which
+    a month-count standard error understates true uncertainty. This is the
+    quantity that motivates building Omega from episode-clustered errors.
+    """
+    n_total = len(regimes) if n_total is None else n_total
+    rows = []
+    for col in cols:
+        for state in sorted(regimes[col].unique()):
+            m = regimes[col] == state
+            n_ep = count_episodes(m)
+            avg = m.sum() / n_ep if n_ep else np.nan
+            rows.append({
+                'variable':     col,
+                'state':        state,
+                'months':       int(m.sum()),
+                'pct':          round(100 * m.sum() / n_total),
+                'episodes':     n_ep,
+                'avg_ep_len':   round(avg, 1),
+                'se_inflation': round(np.sqrt(avg), 2) if avg == avg else np.nan,
+            })
+    return pd.DataFrame(rows).set_index(['variable', 'state'])
+
+
+def association(regimes, col_a, col_b, concordant_pairs):
+    """Cross-classification of two regime axes, plus a strength measure.
+
+    `cramers_v` is 0 under independence, 1 when one axis determines the other.
+    For a 2x2 table it equals |phi|.
+
+    `concordance` is the share of months in the economically paired states,
+    named explicitly via `concordant_pairs` rather than read off the matrix
+    diagonal - the diagonal depends on alphabetical sort order and pairs
+    'high' with 'accommodative', which is the opposite of what is intended.
+    """
+    ct  = pd.crosstab(regimes[col_a], regimes[col_b])
+    n   = ct.values.sum()
+    exp = np.outer(ct.sum(axis=1), ct.sum(axis=0)) / n
+    v   = np.sqrt(((ct.values - exp) ** 2 / exp).sum() / (n * (min(ct.shape) - 1)))
+    summary = pd.Series({
+        'n_months':    int(n),
+        'cramers_v':   round(v, 3),
+        'concordance': round(sum(ct.loc[a, b] for a, b in concordant_pairs) / n, 3),
+        'concordance_if_independent': round(
+            sum((ct.sum(axis=1)[a] / n) * (ct.sum(axis=0)[b] / n)
+                for a, b in concordant_pairs), 3),
+    })
+    return ct, summary
+
+
+def era_split(factor, regime_col, split_year, labels, sample, regimes):
+    """Conditional means by regime state, computed separately within each era.
+
+    Does a regime spread survive WITHIN each era, or does it only appear when
+    eras are pooled? The latter would mean an era effect is being mistaken for
+    a regime effect.
+
+    Run on the FULL history (`calib_full` / `reg_calib_full`), not the restricted
+    calibration window - the whole point is to inspect the period that was
+    excluded. `sample` and `regimes` are explicit arguments here; the notebook
+    cell binds them to the full-history objects.
+
+    Marginal axes are used rather than the 2x2 cells: splitting four cells across
+    two eras leaves eight groups, and the pre-1983 groups are too thin to read.
+    """
+    cut = pd.Period(f'{split_year}-01', 'M')
+    states = sorted(regimes[regime_col].unique())
+    rows = []
+
+    for name, sub in [(labels[0], sample[sample.index < cut]),
+                      (labels[1], sample[sample.index >= cut])]:
+        lbl = regimes.loc[sub.index, regime_col]
+        r = {'era': name, 'n_months': len(sub)}
+        for state in states:
+            m = lbl == state
+            r[f'{state}_n']    = int(m.sum())
+            r[f'{state}_mean'] = sub.loc[m, factor].mean() * 12 if m.sum() else np.nan
+        rows.append(r)
+
+    df = pd.DataFrame(rows).set_index('era')
+    df['spread'] = df[f'{states[0]}_mean'] - df[f'{states[1]}_mean']
+    return df
+
+
+def test_drift(regimes_calib, regimes_test, view_period, grids):
+    """Did the view-date regime persist through the out-of-sample window?
+
+    POST-HOC ONLY. Views are formed once at `view_period`; this measures how
+    much of the test window the resulting static view actually applied to.
+    Never feeds calibration.
+    """
+    rows = []
+    for g in grids:
+        held  = regimes_calib.loc[view_period, g]
+        match = regimes_test[g] == held
+        rows.append({
+            'grid':            g,
+            'view_date_cell':  held,
+            'months_matching': int(match.sum()),
+            'months_total':    len(regimes_test),
+            'pct_matching':    round(100 * match.mean()),
+            'realised_states': ' | '.join(
+                f'{k}: {v}' for k, v in regimes_test[g].value_counts().items()),
+        })
+    return pd.DataFrame(rows).set_index('grid')
+
+
+# ============================================================================
+# Conditional statistics with episode clustering
+# ============================================================================
+
+def conditional_stats(factor_returns, regime_labels, ann=12):
+    """Per-regime performance statistics with episode-clustered standard errors.
+
+    Parameters
+    ----------
+    factor_returns : Series of monthly factor returns
+    regime_labels  : Series of regime state labels, aligned to factor_returns
+    ann            : periods per year (12 for monthly)
+
+    Returns
+    -------
+    DataFrame indexed by regime state.
+
+    Notes
+    -----
+    `se_naive_ann` treats months as independent and is reported only to show how
+    much precision that assumption manufactures. `se_cluster_ann` is computed
+    across contiguous-episode means and is the figure that should inform Omega.
+    """
+    rows = []
+    for state in sorted(regime_labels.unique()):
+        mask = regime_labels == state
+        r = factor_returns[mask]
+        if len(r) == 0:
+            continue
+
+        ep = episode_id(mask)
+        grouped = r.groupby(ep[mask])
+        ep_mean = grouped.mean()
+        ep_cum = grouped.apply(lambda x: (1.0 + x).prod() - 1.0)
+        n_ep = int(len(ep_mean))
+
+        rows.append({
+            'state':          state,
+            'n_months':       int(mask.sum()),
+            'n_episodes':     n_ep,
+            'avg_ep_len':     mask.sum() / n_ep if n_ep else np.nan,
+            'mean_ann':       r.mean() * ann,
+            'std_ann':        r.std(ddof=1) * np.sqrt(ann),
+            'hit_rate':       (r > 0).mean(),
+            'ep_min':         ep_cum.min(),
+            'ep_max':         ep_cum.max(),
+            'se_naive_ann':   r.std(ddof=1) / np.sqrt(len(r)) * ann,
+            'se_cluster_ann': (ep_mean.std(ddof=1) / np.sqrt(n_ep) * ann
+                               if n_ep > 1 else np.nan),
+        })
+
+    out = pd.DataFrame(rows).set_index('state')
+    out['se_ratio'] = out['se_cluster_ann'] / out['se_naive_ann']
+    return out
+
 
 def weight_calc(stock_list, factor_list, start_date, end_date, test_start_date, test_end_date):
     """
@@ -646,15 +937,18 @@ def meucci_black_litterman(mu_prior, sigma_prior, P, Q, omega, tau):
         Prior mean returns
     sigma_prior : np.ndarray
         Prior covariance matrix
-    P : np.ndarray 
+    P : np.ndarray
         Matrix of factor exposures
     Q : np.ndarray
         Vector of expected returns
     omega : np.ndarray
-        Vector of view confidence levels
+        View uncertainty. Either a 1-D vector of per-view variances (placed on
+        the diagonal) or a full k x k matrix. A 1-D vector is diagonalised here:
+        adding it raw would broadcast across rows of P tau Sigma P' and produce
+        a near-singular matrix whose inverse is numerical noise.
     tau : float
-        Risk aversion parameter
-    
+        Prior uncertainty scaling
+
     Returns:
     --------
     np.ndarray: Posterior mean returns
@@ -663,9 +957,11 @@ def meucci_black_litterman(mu_prior, sigma_prior, P, Q, omega, tau):
     # Ensure inputs are numpy arrays
     mu_prior = np.array(mu_prior).reshape(-1, 1)
     sigma_prior = np.array(sigma_prior)
-    P = np.array(P)                         
-    Q = np.array(Q).reshape(-1, 1)     
+    P = np.array(P)
+    Q = np.array(Q).reshape(-1, 1)
     omega = np.array(omega)
+    if omega.ndim == 1:
+        omega = np.diag(omega)
 
     # 1. Calculate the Middle Term
     # This term captures the impact of views on the covariance matrix
@@ -1046,63 +1342,103 @@ def generate_portfolio_returns_dataframe(portfolio_weights_dict, returns_df, sta
     
     return portfolio_returns_df
 
-def tracking_error_and_information_ratio(portfolios_dict, benchmark_weights, sigma_stocks, 
-                                        portfolio_returns_annualized, benchmark_return_annualized):
+def tracking_error_and_information_ratio(portfolios_dict, benchmark_weights, sigma_stocks,
+                                         portfolio_returns_annualized, benchmark_return_annualized,
+                                         returns_df=None, start_date=None, end_date=None,
+                                         periods_per_year=252):
     """
-    Calculate tracking error and information ratio for multiple portfolios.
-    
+    Tracking error and information ratio, reported ex-ante and ex-post.
+
+    Two tracking errors are computed because they answer different questions and
+    must not be mixed:
+
+      TE ex-ante  = sqrt(w_active' @ Sigma @ w_active), Sigma estimated on the
+                    TRAINING window. A forecast of active risk.
+      TE ex-post  = std(active return series) * sqrt(periods_per_year), computed
+                    on the REALISED test-window returns. What actually happened.
+
+    The information ratio is reported only against the ex-post tracking error,
+    because its numerator (realised excess return) is ex-post. Dividing a
+    realised excess return by a forecast risk is neither an ex-ante nor an
+    ex-post IR, and is not reported here.
+
+    `TE Ratio (Post/Ante)` is the diagnostic: above 1 means realised active risk
+    exceeded the forecast. Expect it above 1 for portfolios whose weights were
+    optimised on `sigma_stocks` itself - the optimiser exploits estimation error
+    in Sigma, so the in-sample forecast is biased low.
+
     Parameters:
     -----------
-    portfolios_dict (dict): Dictionary where keys are portfolio names and values are portfolio weights (pd.Series)
-    benchmark_weights (pd.Series): Benchmark weights (e.g., market cap weights)
-    sigma_stocks (pd.DataFrame): Covariance matrix for stocks (annualized, Ledoit-Wolf)
-    portfolio_returns_annualized (dict): Dictionary where keys are portfolio names and values are annualized returns (float)
-    benchmark_return_annualized (float): Annualized benchmark return
-    
+    portfolios_dict (dict): {portfolio name: portfolio weights (pd.Series)}
+    benchmark_weights (pd.Series): Benchmark weights (e.g. market cap weights)
+    sigma_stocks (pd.DataFrame): Annualized covariance matrix for stocks (training window)
+    portfolio_returns_annualized (dict): {portfolio name: realised annualized return (float)}
+    benchmark_return_annualized (float): Realised annualized benchmark return
+    returns_df (pd.DataFrame, optional): Test-window asset returns, dates x tickers.
+        Required for the ex-post columns; if omitted they come back NaN.
+        Must be on the same basis (excess vs total) as the annualized returns above.
+    start_date, end_date (str, optional): Slice applied to `returns_df`
+    periods_per_year (int): Annualization factor for the realised series (252 daily)
+
     Returns:
     --------
-    pd.DataFrame: DataFrame with columns:
-        - 'Tracking Error (Annualized %)'
+    pd.DataFrame indexed by portfolio name, with columns:
+        - 'TE Ex-Ante (Annualized %)'
+        - 'TE Ex-Post (Annualized %)'
+        - 'TE Ratio (Post/Ante)'
         - 'Portfolio Return (Annualized %)'
         - 'Benchmark Return (Annualized %)'
         - 'Excess Return (Annualized %)'
-        - 'Information Ratio'
+        - 'IR Ex-Post'
     """
-    tracking_errors = {}
-    information_ratios = {}
-    
-    # Calculate tracking error for each portfolio
+    if returns_df is not None and (start_date is not None or end_date is not None):
+        returns_df = returns_df.loc[start_date:end_date]
+
+    rows = {}
+
     for portfolio_name, portfolio_weights in portfolios_dict.items():
-        # Calculate active weights
+        # Active weights. Pandas aligns on index, so a ticker present in one leg
+        # but not the other yields NaN - caught here rather than propagating
+        # silently into a NaN tracking error.
         active_weights = portfolio_weights - benchmark_weights
-        
-        # Ensure alignment with covariance matrix
         active_weights_aligned = active_weights.loc[sigma_stocks.index]
-        
-        # Calculate tracking error: sqrt(w_active' @ Sigma @ w_active)
-        tracking_error = np.sqrt(active_weights_aligned.values.T @ sigma_stocks.values @ active_weights_aligned.values)
-        
-        tracking_errors[portfolio_name] = tracking_error
-        
-        # Calculate information ratio
-        if portfolio_name in portfolio_returns_annualized:
-            excess_return = portfolio_returns_annualized[portfolio_name] - benchmark_return_annualized
-            
-            if tracking_error > 0:
-                ir = excess_return / tracking_error
-            else:
-                ir = np.nan
-            
-            information_ratios[portfolio_name] = ir
-    
-    # Create comprehensive results table
-    results_df = pd.DataFrame({
-        'Tracking Error (Annualized %)': [te * 100 for te in tracking_errors.values()],
-        'Portfolio Return (Annualized %)': [portfolio_returns_annualized[p] * 100 for p in portfolios_dict.keys()],
-        'Benchmark Return (Annualized %)': benchmark_return_annualized * 100,
-        'Excess Return (Annualized %)': [(portfolio_returns_annualized[p] - benchmark_return_annualized) * 100 
-                                         for p in portfolios_dict.keys()],
-        'Information Ratio': list(information_ratios.values())
-    }, index=portfolios_dict.keys())
-    
-    return results_df
+        if active_weights_aligned.isna().any():
+            missing = list(active_weights_aligned.index[active_weights_aligned.isna()])
+            raise ValueError(
+                f"'{portfolio_name}': active weights are NaN for {missing}. "
+                "Portfolio and benchmark weights must cover sigma_stocks.index."
+            )
+
+        # --- Ex-ante: forecast from the training-window covariance -----------
+        te_ante = np.sqrt(
+            active_weights_aligned.values.T @ sigma_stocks.values @ active_weights_aligned.values
+        )
+
+        # --- Ex-post: realised dispersion of the active return series --------
+        te_post = np.nan
+        if returns_df is not None:
+            cols = [c for c in active_weights_aligned.index if c in returns_df.columns]
+            missing_cols = [c for c in active_weights_aligned.index if c not in returns_df.columns]
+            if missing_cols:
+                raise ValueError(
+                    f"'{portfolio_name}': returns_df has no columns for {missing_cols}."
+                )
+            active_series = (returns_df[cols] * active_weights_aligned[cols]).sum(axis=1)
+            if len(active_series) > 1:
+                te_post = active_series.std(ddof=1) * np.sqrt(periods_per_year)
+
+        excess_return = (portfolio_returns_annualized[portfolio_name]
+                         - benchmark_return_annualized)
+
+        rows[portfolio_name] = {
+            'TE Ex-Ante (Annualized %)':       te_ante * 100,
+            'TE Ex-Post (Annualized %)':       te_post * 100,
+            'TE Ratio (Post/Ante)':            te_post / te_ante if te_ante > 0 else np.nan,
+            'Portfolio Return (Annualized %)': portfolio_returns_annualized[portfolio_name] * 100,
+            'Benchmark Return (Annualized %)': benchmark_return_annualized * 100,
+            'Excess Return (Annualized %)':    excess_return * 100,
+            # IR against the ex-post TE only: both terms realised, same window
+            'IR Ex-Post':                      excess_return / te_post if te_post > 0 else np.nan,
+        }
+
+    return pd.DataFrame(rows).T
